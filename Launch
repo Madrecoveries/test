@@ -1,0 +1,7 @@
+pip install fastapi uvicorn mavsdk
+uvicorn main:app --reload
+
+npm create vite@latest frontend --template react
+cd frontend
+npm install react-leaflet leaflet
+npm run dev
