@@ -1,0 +1,94 @@
+pip install mavsdk
+import asyncio
+from mavsdk import System
+from mavsdk.geofence import Point, Polygon
+from mavsdk.action import ActionError
+from mavsdk.offboard import OffboardError, PositionNedYaw
+
+# Define your geofence area (lat, lon)
+FENCE_POINTS = [
+    Point(latitude=-37.814, longitude=144.96332),  # Example points (Melbourne CBD)
+    Point(latitude=-37.814, longitude=144.97000),
+    Point(latitude=-37.820, longitude=144.97000),
+    Point(latitude=-37.820, longitude=144.96332)
+]
+
+MAX_ALTITUDE = 60  # meters
+HOME_LAT = -37.817  # launch point
+HOME_LON = 144.966
+HOME_ALT = 0
+
+async def main():
+    drone = System()
+    await drone.connect(system_address="udp://:14540")
+
+    print("Waiting for drone to connect...")
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print("-- Connected to drone")
+            break
+
+    # Upload geofence
+    polygon = Polygon(FENCE_POINTS, Polygon.FenceType.INCLUSION)
+    await drone.geofence.upload_geofence([polygon])
+    print("-- Geofence uploaded")
+
+    # Wait for global position estimate
+    print("Waiting for global position estimate...")
+    async for health in drone.telemetry.health():
+        if health.is_global_position_ok and health.is_home_position_ok:
+            print("-- Global position OK")
+            break
+
+    # Arm only if within fence
+    async for pos in drone.telemetry.position():
+        lat, lon, abs_alt = pos.latitude_deg, pos.longitude_deg, pos.absolute_altitude_m
+        if is_within_fence(lat, lon, abs_alt):
+            print("-- Within geofence, arming")
+            await drone.action.arm()
+            break
+        else:
+            print("Drone is outside of geofence area. Move it within bounds.")
+            await asyncio.sleep(5)
+
+    # Start offboard control
+    await drone.offboard.set_position_ned(PositionNedYaw(0.0, 0.0, -5.0, 0.0))
+    try:
+        await drone.offboard.start()
+        print("-- Offboard mode started")
+
+        # Fly pattern while checking geofence
+        for i in range(10):
+            async for pos in drone.telemetry.position():
+                if not is_within_fence(pos.latitude_deg, pos.longitude_deg, pos.absolute_altitude_m):
+                    print("⚠️ Geofence breach detected! Returning home...")
+                    await drone.action.return_to_launch()
+                    return
+            await drone.offboard.set_position_ned(PositionNedYaw(5*i, 0, -5, 0))
+            await asyncio.sleep(3)
+
+        print("-- Returning to launch")
+        await drone.action.return_to_launch()
+
+    except OffboardError as e:
+        print(f"Offboard mode error: {e._result.result}")
+        await drone.action.disarm()
+    except ActionError as e:
+        print(f"Action error: {e}")
+
+def is_within_fence(lat, lon, alt):
+    """
+    Very basic boundary check for rectangular area.
+    For production, use shapely or haversine to handle polygon checks accurately.
+    """
+    lat_min = min(p.latitude for p in FENCE_POINTS)
+    lat_max = max(p.latitude for p in FENCE_POINTS)
+    lon_min = min(p.longitude for p in FENCE_POINTS)
+    lon_max = max(p.longitude for p in FENCE_POINTS)
+
+    if lat_min <= lat <= lat_max and lon_min <= lon <= lon_max and alt <= MAX_ALTITUDE:
+        return True
+    return False
+
+if __name__ == "__main__":
+    asyncio.run(main())
