@@ -1,0 +1,105 @@
+import asyncio
+import math
+from mavsdk import System
+from mavsdk.offboard import PositionNedYaw
+from mavsdk.action import ActionError
+from mavsdk.offboard import OffboardError
+
+# Configurable parameters
+MAX_RADIUS_M = 100.0       # Max allowed distance from dynamic center (meters)
+MAX_ALTITUDE_M = 60.0
+UPDATE_INTERVAL = 2.0      # seconds
+RTL_ON_BREACH = True
+
+# Starting center position (will dynamically change)
+home_lat = -37.817
+home_lon = 144.966
+home_alt = 0.0
+
+async def main():
+    drone = System()
+    await drone.connect(system_address="udp://:14540")
+
+    print("Waiting for connection...")
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print("-- Drone connected")
+            break
+
+    print("Waiting for global position estimate...")
+    async for health in drone.telemetry.health():
+        if health.is_global_position_ok and health.is_home_position_ok:
+            print("-- Global position OK")
+            break
+
+    # Arm and start offboard mode
+    await drone.action.arm()
+    await drone.offboard.set_position_ned(PositionNedYaw(0.0, 0.0, -5.0, 0.0))
+    try:
+        await drone.offboard.start()
+        print("-- Offboard mode started")
+    except OffboardError as e:
+        print(f"Offboard start failed: {e}")
+        return
+
+    # Start dynamic geofence monitoring
+    asyncio.create_task(dynamic_geofence_monitor(drone))
+
+    # Example: simulate movement commands
+    for i in range(20):
+        await drone.offboard.set_position_ned(PositionNedYaw(2*i, 0, -5, 0))
+        await asyncio.sleep(3)
+
+    await drone.action.return_to_launch()
+    print("-- Mission complete")
+
+async def dynamic_geofence_monitor(drone):
+    """
+    Periodically checks the drone's distance from a dynamic geofence center.
+    The center can change based on external input (e.g., vehicle GPS).
+    """
+    global home_lat, home_lon
+
+    while True:
+        async for pos in drone.telemetry.position():
+            drone_lat = pos.latitude_deg
+            drone_lon = pos.longitude_deg
+            drone_alt = pos.relative_altitude_m
+
+            # Simulate moving geofence center (for demo)
+            # Replace this with live input (e.g., vehicle GPS)
+            home_lat += 0.00001  # ~1.1 m drift eastward per loop
+            home_lon += 0.00001
+
+            dist_m = haversine(home_lat, home_lon, drone_lat, drone_lon)
+
+            if dist_m > MAX_RADIUS_M or drone_alt > MAX_ALTITUDE_M:
+                print(f"⚠️ Geofence breach! Distance={dist_m:.1f}m Alt={drone_alt:.1f}m")
+                if RTL_ON_BREACH:
+                    await drone.action.return_to_launch()
+                    return
+                else:
+                    print("-- Holding position...")
+                    await drone.offboard.set_position_ned(PositionNedYaw(0, 0, -5, 0))
+            else:
+                print(f"✅ Within fence: {dist_m:.1f}m from center")
+            break
+
+        await asyncio.sleep(UPDATE_INTERVAL)
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate great-circle distance between two lat/lon pairs in meters."""
+    R = 6371000  # Earth radius (m)
+    d_lat = math.radians(lat2 - lat1)
+    d_lon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(d_lon / 2) ** 2
+    )
+    return 2 * R * math.asin(math.sqrt(a))
+
+if __name__ == "__main__":
+    asyncio.run(main())
