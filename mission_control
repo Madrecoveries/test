@@ -1,0 +1,231 @@
+# mission_control.py
+# Requires: pip install mavsdk asyncio opencv-python apriltag-python (if using marker), numpy
+# This script is an example companion-computer mission controller for PX4 using MAVSDK.
+# It uses async/await and assumes MAVSDK server is reachable (e.g. UDP:14540 for SITL or serial for real hardware).
+
+import asyncio
+import math
+import time
+from mavsdk import System
+from mavsdk import (Telemetry, Action, Offboard, PositionNedYaw)
+import numpy as np
+
+# --- CONFIG ---
+TARGET_WAYPOINT = ( -37.810000, 144.960000, 10.0 )  # lat, lon, altitude (m) - example, replace
+HOME_COORD = None  # if None, set automatically to vehicle's home on connect
+TAKEOFF_ALT = 10.0  # meters
+CRUISE_SPEED_MS = 5.0
+GOTO_TOLERANCE_M = 2.5
+LANDING_ALT_THRESHOLD_M = 1.5  # if below this and marker not found, attempt land
+LOW_BATTERY_THRESHOLD = 20  # percent
+RTL_ALTITUDE = 12.0  # altitude for RTL
+CONNECTION_TIMEOUT = 30  # s
+# ----------------
+
+async def wait_for_connection(drone: System, timeout=CONNECTION_TIMEOUT):
+    connected = False
+    start = time.time()
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print(f"Connected to drone with UUID: {state.uuid}")
+            connected = True
+            break
+        if time.time() - start > timeout:
+            break
+    if not connected:
+        raise RuntimeError("Failed to connect to drone within timeout")
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    # returns distance in meters
+    R = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2*R*math.asin(math.sqrt(a))
+
+async def get_current_position(drone: System):
+    async for pos in drone.telemetry.position():
+        return (pos.latitude_deg, pos.longitude_deg, pos.absolute_altitude_m)
+
+async def set_home_if_none(drone: System):
+    global HOME_COORD
+    if HOME_COORD is not None:
+        print("Using configured HOME_COORD")
+        return HOME_COORD
+    # Wait for GPS fix & position
+    print("Waiting for GPS fix and first position...")
+    async for health in drone.telemetry.health():
+        if health.is_global_position_ok:
+            print("Global position OK")
+            break
+    pos = await get_current_position(drone)
+    HOME_COORD = (pos[0], pos[1], pos[2])
+    print(f"Home set to {HOME_COORD}")
+    return HOME_COORD
+
+async def arm_and_takeoff(drone: System, altitude_m):
+    print("Arming...")
+    await drone.action.set_takeoff_altitude(altitude_m)
+    await drone.action.arm()
+    await asyncio.sleep(1)
+    print("Taking off...")
+    await drone.action.takeoff()
+    # wait until reaching altitude (rough)
+    reached = False
+    async for position in drone.telemetry.position():
+        cur_alt = position.relative_altitude_m
+        print(f"Takeoff - relative alt {cur_alt:.1f} m")
+        if cur_alt >= altitude_m*0.9:
+            reached = True
+            break
+        await asyncio.sleep(0.5)
+    if not reached:
+        print("Warning: did not reach takeoff altitude as expected")
+
+async def goto_location(drone: System, lat, lon, alt):
+    # Use action.goto_location (lat, lon, alt, yaw_deg) if available, else use mission items
+    print(f"Navigating to {lat:.7f}, {lon:.7f}, {alt}m")
+    # mavsdk.action.goto_location expects absolute altitude above WGS84 ellipsoid in meters.
+    # Using Telemetry to get current position to compute flight.
+    await drone.action.goto_location(lat, lon, alt, 0.0)
+    # monitor progress
+    while True:
+        pos = await get_current_position(drone)
+        if pos is None:
+            await asyncio.sleep(0.5)
+            continue
+        dist = haversine_m(pos[0], pos[1], lat, lon)
+        print(f"Distance to target: {dist:.1f} m, current alt rel: {pos[2]:.1f}m")
+        if dist <= GOTO_TOLERANCE_M:
+            print("Reached waypoint (within tolerance).")
+            break
+        # battery check
+        async for bat in drone.telemetry.battery():
+            if bat.remaining_percent is not None and bat.remaining_percent*100 <= LOW_BATTERY_THRESHOLD:
+                print("Low battery detected during transit! Initiating RTL.")
+                await initiate_rtl(drone)
+                return False
+            break
+        await asyncio.sleep(1)
+    return True
+
+async def initiate_rtl(drone: System):
+    print("Setting RTL altitude then returning to launch (RTH).")
+    await drone.action.set_return_to_launch_altitude(RTL_ALTITUDE)
+    await drone.action.return_to_launch()
+
+async def precision_land_sequence(drone: System, vision_marker_callback=None):
+    """
+    Try to detect vision marker for precision landing.
+    vision_marker_callback should be an async function that returns (found:bool, lat, lon) or None.
+    """
+    print("Starting precision landing sequence.")
+    # Descend slowly while searching for marker
+    current_pos = await get_current_position(drone)
+    target_lat, target_lon, _ = current_pos
+    descent_step = 1.0  # m
+    min_alt = 0.3
+    # tell FC to land if marker not found after some smaller altitude
+    while True:
+        pos = await get_current_position(drone)
+        _, _, rel_alt = pos
+        print(f"Precision landing: current rel alt {rel_alt:.2f} m")
+        if vision_marker_callback is not None:
+            found, lat, lon = await vision_marker_callback()
+            if found:
+                print("Marker found! Navigating to marker and descending for precision landing.")
+                # direct descent to marker using goto_location then land
+                await drone.action.goto_location(lat, lon, rel_alt + 0.5, 0.0)
+                await asyncio.sleep(1)
+                await drone.action.land()
+                return
+        if rel_alt <= LANDING_ALT_THRESHOLD_M:
+            print("Marker not found and close to ground threshold — performing normal land.")
+            await drone.action.land()
+            return
+        # step down by commanding position with a lower altitude (if supported), else set landing
+        # Here we just sleep and let the FC handle slow landing by switching to LAND mode at the right moment.
+        # Alternatively, could command velocity downwards via Offboard.
+        await asyncio.sleep(1.0)
+
+async def dummy_vision_marker_detector():
+    """
+    Placeholder: replace with real vision code that checks a camera frame for an AprilTag or marker.
+    Return (found: bool, lat: float, lon: float)
+    """
+    # This dummy never finds a marker.
+    await asyncio.sleep(0.01)
+    return (False, None, None)
+
+async def monitor_mission(drone: System):
+    # Simple telemetry monitoring
+    async for bat in drone.telemetry.battery():
+        if bat.remaining_percent is not None:
+            print(f"Battery: {bat.remaining_percent*100:.1f}%")
+        await asyncio.sleep(1.0)
+        break
+
+async def main():
+    drone = System()
+    # connect to the vehicle; change the URL for your link (SITL: udp://:14540) or serial: serial:///dev/ttyACM0:921600
+    print("Connecting to drone on udp://:14540 ...")
+    await drone.connect(system_address="udp://:14540")
+
+    await wait_for_connection(drone)
+
+    # set home if not predefined
+    home = await set_home_if_none(drone)
+
+    # Set speed
+    await drone.action.set_maximum_speed(CRUISE_SPEED_MS)
+
+    # Arm and takeoff
+    await arm_and_takeoff(drone, TAKEOFF_ALT)
+
+    # Navigate to target waypoint
+    ok = await goto_location(drone, TARGET_WAYPOINT[0], TARGET_WAYPOINT[1], TARGET_WAYPOINT[2])
+    if not ok:
+        print("Aborted mission - returned early.")
+        return
+
+    # Do any mission tasks here (hover, sensor capture)
+    print("At waypoint — hovering for 5s")
+    await asyncio.sleep(5)
+
+    # Return to Home (RTL) - do a safe return
+    print("Initiating RTL back to Home...")
+    await initiate_rtl(drone)
+
+    # Wait until close to home, then attempt precision landing using vision
+    # Watch position, and when close horizontally & altitude is low, run precision landing
+    while True:
+        pos = await get_current_position(drone)
+        lat, lon, abs_alt = pos
+        dist_home = haversine_m(lat, lon, home[0], home[1])
+        print(f"Distance to home: {dist_home:.1f} m, alt: {abs_alt:.1f} m")
+        if dist_home <= 15.0 and abs_alt <= 6.0:
+            # Call precision landing sequence with a vision callback
+            await precision_land_sequence(drone, vision_marker_callback=dummy_vision_marker_detector)
+            break
+        await asyncio.sleep(1.0)
+
+    # Wait for landed and disarm
+    print("Waiting for disarm...")
+    async for in_air in drone.telemetry.in_air():
+        if not in_air:
+            print("Landed.")
+            break
+        await asyncio.sleep(0.5)
+
+    print("Disarming...")
+    try:
+        await drone.action.disarm()
+    except Exception as e:
+        print("Disarm call may have failed or already disarmed:", e)
+
+    print("Mission complete.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
