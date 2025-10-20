@@ -1,0 +1,48 @@
+// frontend/src/App.jsx
+import { useState, useEffect } from "react";
+import { MapContainer, TileLayer, Marker, Circle } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+
+function App() {
+  const [drone, setDrone] = useState(null);
+
+  useEffect(() => {
+    const ws = new WebSocket("ws://localhost:8000/ws");
+    ws.onmessage = (event) => {
+      setDrone(JSON.parse(event.data));
+    };
+  }, []);
+
+  const sendCommand = async (cmd) => {
+    await fetch(`http://localhost:8000/${cmd}`, { method: "POST" });
+  };
+
+  if (!drone) return <div>Connecting...</div>;
+
+  return (
+    <div className="h-screen w-screen flex flex-col">
+      <div className="p-4 flex gap-4 bg-gray-100">
+        <button onClick={() => sendCommand("arm")}>Arm</button>
+        <button onClick={() => sendCommand("takeoff")}>Takeoff</button>
+        <button onClick={() => sendCommand("rtl")}>RTL</button>
+        <span>Lat: {drone.lat.toFixed(5)} Lon: {drone.lon.toFixed(5)} Alt: {drone.alt.toFixed(1)}m</span>
+      </div>
+
+      <MapContainer
+        center={[drone.lat, drone.lon]}
+        zoom={18}
+        style={{ height: "100%", width: "100%" }}
+      >
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+        <Marker position={[drone.lat, drone.lon]} />
+        <Circle
+          center={[drone.fence_center.lat, drone.fence_center.lon]}
+          radius={drone.fence_radius}
+          pathOptions={{ color: "red", fillOpacity: 0.2 }}
+        />
+      </MapContainer>
+    </div>
+  );
+}
+
+export default App;
