@@ -1,0 +1,63 @@
+# backend/main.py
+import asyncio
+from fastapi import FastAPI, WebSocket
+from mavsdk import System
+from mavsdk.offboard import PositionNedYaw
+from mavsdk.action import ActionError, OffboardError
+import math
+
+app = FastAPI()
+drone = System()
+home = {"lat": -37.817, "lon": 144.966}
+fence_radius = 100.0
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(connect_drone())
+
+async def connect_drone():
+    await drone.connect(system_address="udp://:14540")
+    print("Connecting to drone...")
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print("✅ Connected to drone")
+            break
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    while True:
+        async for pos in drone.telemetry.position():
+            data = {
+                "lat": pos.latitude_deg,
+                "lon": pos.longitude_deg,
+                "alt": pos.relative_altitude_m,
+                "fence_center": home,
+                "fence_radius": fence_radius,
+            }
+            await ws.send_json(data)
+            await asyncio.sleep(1)
+            break
+
+@app.post("/arm")
+async def arm():
+    await drone.action.arm()
+    return {"status": "armed"}
+
+@app.post("/takeoff")
+async def takeoff():
+    await drone.action.takeoff()
+    return {"status": "taking off"}
+
+@app.post("/rtl")
+async def rtl():
+    await drone.action.return_to_launch()
+    return {"status": "returning home"}
+
+@app.post("/update_fence")
+async def update_fence(lat: float, lon: float, radius: float):
+    global home, fence_radius
+    home["lat"] = lat
+    home["lon"] = lon
+    fence_radius = radius
+    return {"status": "updated", "home": home, "radius": fence_radius}
